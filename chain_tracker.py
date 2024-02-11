@@ -2,14 +2,19 @@ from pushover import *
 from GeckoTerminalApi import *
 import json
 import logging
+import warnings
+from GoPlus import GoPlusInteractor
 
+warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-def format_message(data):
-    formatted_data = {key: human_readable_number(value) if isinstance(value, (int, float)) else value for key, value in
-                      data.items()}
-    return "\n".join(f"{key} -> {value}" for key, value in formatted_data.items()) + "\n\n"
+def format_message(data, additional_info=None):
+    formatted_data = {key: human_readable_number(value) if isinstance(value, (int, float)) else value for key, value in data.items()}
+    message = "\n".join(f"{key} -> {value}" for key, value in formatted_data.items())
+    if additional_info:
+        message += "\n" + "\n".join(additional_info)
+    return message + "\n\n"
 
 
 def convert_to_float(column):
@@ -30,19 +35,51 @@ def human_readable_number(num):
     return f"{num:.1f}T"
 
 
+def check_flags(df):
+    if df is None:
+        return []  # or return None, depending on your handling logic
+
+    red_flags = ['_is_airdrop_scam', '_transfer_pausable', '_trading_cooldown', '_selfdestruct', '_is_honeypot',
+                 '_honeypot_with_same_creator', '_fake_token', '_is_proxy', '_external_call', '_cannot_sell_all',
+                 '_personal_slippage_modifiable', '_cannot_buy']
+    warning_flags = ['_hidden_owner', '_is_whitelisted', '_trust_list', '_is_blacklisted', '_slippage_modifiable',
+                     '_is_mintable', '_anti_whale_modifiable', '_is_anti_whale']
+    features = ['_buy_tax', '_sell_tax']
+
+    # Check red flags
+    for flag in red_flags:
+        if flag in df.columns and df[flag].notnull().any() and (df[flag] != 0).any():
+            return None  # Has red flag, return None to skip this record
+
+    # Collect warning flags and features
+    alerts = []
+    for flag in warning_flags + features:
+        if flag in df.columns:
+            value = df.iloc[0][flag]
+            if flag in warning_flags and ((flag == '_is_anti_whale' and value != 1) or (
+                    flag != '_is_anti_whale' and (value == 0 or pd.isnull(value)))):
+                alerts.append(f"{flag} alert")
+            elif flag in features:
+                alerts.append(f"{flag}: {value}")
+
+    return alerts
+
+
 if __name__ == "__main__":
-    app_token = ""
-    user_key = ""
+    app_token = "a44h1qfumco28y1k16tx2dt2ee2tyo"
+    user_key = "uyuujduno4neyd4z5i97egsaov75ro"
 
     notifier = PushoverNotifier(app_token, user_key)
     api = GeckoTerminalAPI()
 
     all_pools = pd.DataFrame()
 
-    specified_networks = ['eth', 'ton']
+    specified_networks = ['eth']
 
     previous_data = []
     previous_ids = set()
+    interactor = GoPlusInteractor(access_token=None)
+
     while True:
         for network in specified_networks:
             logging.info(f"Fetching new pools for network: {network}")
@@ -55,28 +92,38 @@ if __name__ == "__main__":
         all_pools['chain'] = all_pools['id'].str.split('_', expand=True)[0]
 
         result = all_pools[
-            ["id", "attributes.name", "attributes.pool_created_at", "attributes.fdv_usd", "attributes.reserve_in_usd",
-             "attributes.volume_usd.h24", "attributes.price_change_percentage.h1",
-             "attributes.price_change_percentage.h24"]]
-        new_column_names = ["id", "name", "pool_created_at", "fdv_usd", "reserve_in_usd", "volume_usd_24h",
-                            "price_change_percentage_1h", "price_change_percentage_24h"]
+            ["id", "relationships.base_token.data.id", "attributes.name", "attributes.pool_created_at",
+             "attributes.fdv_usd", "attributes.reserve_in_usd",
+             "attributes.volume_usd.h24", "attributes.price_change_percentage.h24",
+             "attributes.transactions.h24.buyers", "attributes.transactions.h24.buys",
+             "attributes.transactions.h24.sellers", "attributes.transactions.h24.sells"]]
+        new_column_names = ["ID", "TOKEN_ID", "NAME", "CREATED", "FDV", "LIQUIDITY", "VOLUME",
+                            "% CHANGE 24", "BUYERS", "BUYS", "SELLERS", "SELLS"]
         result.columns = new_column_names
-        result['pool_created_at'] = pd.to_datetime(result['pool_created_at'])
-        result['pool_created_at'] = result['pool_created_at'] + pd.Timedelta(hours=1)
+        result['CREATED'] = pd.to_datetime(result['CREATED'])
+        result['CREATED'] = result['CREATED'] + pd.Timedelta(hours=1)
+        result['TOKEN_ID'] = result['TOKEN_ID'].apply(lambda x: x[4:])
 
         current_pools_dicts = result.to_dict(orient='records')
-
-        new_records = [record for record in current_pools_dicts if record['id'] not in previous_ids]
+        new_records = [record for record in current_pools_dicts if record['ID'] not in previous_ids]
 
         if new_records:
-            message_str = "".join(format_message(record) for record in new_records)
-            response = notifier.send_notification(message_str, url_title='Coingecko Chart',
-                                                  url='https://www.geckoterminal.com/pl/zksync/pools/',
-                                                  title="New pool alert")
-            logging.info("Scan has been done, found new pool, alert has been sent")
-            previous_ids.update(record['id'] for record in new_records)
+            for record in new_records:
+                response = interactor.fetch_data(chain_id="1", addresses=[record['TOKEN_ID']])
+                df = interactor.parse_to_dataframe(response)
+
+                alerts = check_flags(df)
+                if alerts is not None:  # Only proceed if no red flags
+                    message_str = format_message(record, additional_info=alerts)
+                    response = notifier.send_notification(message_str, url_title='Coingecko Chart',
+                                                          url='https://www.geckoterminal.com/pl/zksync/pools/',
+                                                          title="New pool alert")
+                    logging.info("Scan has been done, found new pool without red flags, alert has been sent")
+                else:
+                    logging.info(f"Pool {record['ID']} skipped due to red flags")
+
+            previous_ids.update(record['ID'] for record in new_records)
         else:
             logging.info("No new pools found, waiting for new pools...")
 
-        previous_data = current_pools_dicts
         logging.info("Scan has been done, starting a new scan")
